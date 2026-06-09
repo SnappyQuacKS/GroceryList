@@ -1,166 +1,45 @@
 # test_grocery_model.py
 import unittest
-from typing import Optional, List as TypeList
 
-# Import the core entity data structural blueprints from your original file
-from grocery_model import User, Item, ListEntry, GroceryList
-
-# ==========================================
-# SIMULATED DATABASE ENGINE (FOR TESTING STATE)
-# ==========================================
-class MockDatabase:
-    def __init__(self):
-        self.lists = {}
-        self.items = {}
-        self.entries = []
-
-    def clear(self):
-        self.lists.clear()
-        self.items.clear()
-        self.entries.clear()
-
-db = MockDatabase()
+# The managers under test now live in the model itself (no more concrete
+# re-implementations inside the test file).
+from grocery_model import User, Database, ListManager, ItemManager
 
 
-# ==========================================
-# WORKING TEST IMPLEMENTATION OF CONTROLLERS
-# ==========================================
-class ConcreteListManager:
-    def createList(self, name: str, listId: str, optionalParentId: Optional[str] = None, userId: Optional[str] = None) -> GroceryList:
-        if optionalParentId and name == "":
-            parent = db.lists.get(optionalParentId)
-            name = f"Copy of {parent.listName}" if parent else "Copy of List"
-        elif name == "":
-            name = f"List{len(db.lists) + 1}"
-            
-        g_list = GroceryList(name, listId, optionalParentId, userId)
-        db.lists[listId] = g_list
-        return g_list
-
-    def readListDisplayItems(self, listId: str) -> TypeList[dict]:
-        """Runs the Bottom-Up Compilation Loop specified in the model design."""
-        display_map = {}
-        current_pointer = listId
-        
-        while current_pointer is not None:
-            current_entries = [e for e in db.entries if e.listId == current_pointer]
-            
-            for entry in current_entries:
-                if entry.itemId in display_map:
-                    continue
-                if entry.isMaskedHidden:
-                    display_map[entry.itemId] = {"hidden": True}
-                    continue
-                
-                master_item = db.items.get(entry.itemId)
-                item_name = entry.customNameOverride if entry.customNameOverride else (master_item.itemName if master_item else "Unknown")
-                
-                display_map[entry.itemId] = {
-                    "itemId": entry.itemId,
-                    "name": item_name,
-                    "isChecked": entry.isChecked,
-                    "isInherited": entry.listId != listId,
-                    "hidden": False
-                }
-            
-            g_list = db.lists.get(current_pointer)
-            current_pointer = g_list.parentId if g_list else None
-            
-        return [v for k, v in display_map.items() if not v.get("hidden", False)]
-
-    def deleteList(self, listId: str) -> None:
-        """Safely removes a node, running Dynamic Relationship Repair and Hard-Copy captures."""
-        target_list = db.lists.get(listId)
-        if not target_list:
-            return
-            
-        grandparent_id = target_list.parentId
-        immediate_children = [l for l in db.lists.values() if l.parentId == listId]
-        
-        # 1. Gather snapshots and upgrade child structural pointers while parent data is intact
-        child_snapshots = {}
-        for child in immediate_children:
-            child_snapshots[child.listId] = self.readListDisplayItems(child.listId)
-            
-            if grandparent_id:
-                child.parentId = grandparent_id
-            else:
-                child.parentId = None
-
-        # 2. Safely purge the deleted parent list's native records
-        db.entries = [e for e in db.entries if e.listId != listId]
-        
-        # 3. Commit hard-copy snapshot injections for orphaned standalone lists
-        for child in immediate_children:
-            if not grandparent_id:
-                db.entries = [e for e in db.entries if e.listId != child.listId]
-                
-                for snap_item in child_snapshots[child.listId]:
-                    new_entry = ListEntry(listId=child.listId, itemId=snap_item["itemId"], isChecked=snap_item["isChecked"])
-                    db.entries.append(new_entry)
-                    
-        if listId in db.lists:
-            del db.lists[listId]
-
-
-class ConcreteItemManager:
-    def addItemToList(self, listId: str, itemId: str, itemName: str) -> None:
-        if itemId not in db.items:
-            db.items[itemId] = Item(itemId, itemName)
-        entry = ListEntry(listId=listId, itemId=itemId)
-        db.entries.append(entry)
-
-    def editItemInList(self, listId: str, itemId: str, newName: str) -> None:
-        native_entry = next((e for e in db.entries if e.listId == listId and e.itemId == itemId), None)
-        
-        if native_entry:
-            master_item = db.items.get(itemId)
-            if master_item:
-                master_item.itemName = newName
-        else:
-            forked_entry = ListEntry(listId=listId, itemId=itemId, customNameOverride=newName)
-            db.entries.append(forked_entry)
-
-    def removeItemFromList(self, listId: str, itemId: str) -> None:
-        native_entry = next((e for e in db.entries if e.listId == listId and e.itemId == itemId), None)
-        
-        if native_entry:
-            db.entries.remove(native_entry)
-        else:
-            mask_entry = ListEntry(listId=listId, itemId=itemId, isMaskedHidden=True)
-            db.entries.append(mask_entry)
-
-
-# ==========================================
-# 4. AUTOMATED SYSTEM TEST CASES
-# ==========================================
 class TestGroceryDataModel(unittest.TestCase):
 
     def setUp(self):
-        db.clear()
-        self.list_manager = ConcreteListManager()
-        self.item_manager = ConcreteItemManager()
+        self.db = Database()
+        self.list_manager = ListManager(self.db)
+        self.item_manager = ItemManager(self.db)
+
+    # ------------------------------------------
+    # Original behavioral tests
+    # ------------------------------------------
 
     def test_create_and_read_hierarchy(self):
         self.list_manager.createList(name="Weekly Grocery", listId="L1")
         self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Whole Milk")
         self.list_manager.createList(name="", listId="L2", optionalParentId="L1")
-        
+
         child_items = self.list_manager.readListDisplayItems("L2")
         self.assertEqual(len(child_items), 1)
         self.assertEqual(child_items[0]["name"], "Whole Milk")
-        self.assertTrue(child_items[0]["isInherited"])  
+        self.assertTrue(child_items[0]["isInherited"])
+
+        # Empty name with a parent should auto-name as a copy
+        self.assertEqual(self.db.lists["L2"].listName, "Copy of Weekly Grocery")
 
     def test_item_editing_and_forking(self):
         self.list_manager.createList(name="Master List", listId="L1")
         self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Apples")
         self.list_manager.createList(name="Child List", listId="L2", optionalParentId="L1")
-        
+
         self.item_manager.editItemInList(listId="L2", itemId="I1", newName="Organic Green Apples")
-        
+
         parent_view = self.list_manager.readListDisplayItems("L1")
         child_view = self.list_manager.readListDisplayItems("L2")
-        
+
         self.assertEqual(parent_view[0]["name"], "Apples")
         self.assertEqual(child_view[0]["name"], "Organic Green Apples")
 
@@ -168,12 +47,12 @@ class TestGroceryDataModel(unittest.TestCase):
         self.list_manager.createList(name="Master List", listId="L1")
         self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Banana")
         self.list_manager.createList(name="Child List", listId="L2", optionalParentId="L1")
-        
+
         self.item_manager.removeItemFromList(listId="L2", itemId="I1")
-        
+
         parent_view = self.list_manager.readListDisplayItems("L1")
         child_view = self.list_manager.readListDisplayItems("L2")
-        
+
         self.assertEqual(len(parent_view), 1)
         self.assertEqual(len(child_view), 0)
 
@@ -181,53 +60,219 @@ class TestGroceryDataModel(unittest.TestCase):
         self.list_manager.createList(name="Grandparent", listId="L1")
         self.list_manager.createList(name="Parent", listId="L2", optionalParentId="L1")
         self.list_manager.createList(name="Child", listId="L3", optionalParentId="L2")
-        
+
         self.list_manager.deleteList("L2")
-        
-        child_list = db.lists.get("L3")
+
+        child_list = self.db.lists.get("L3")
         self.assertEqual(child_list.parentId, "L1")
 
     def test_cascading_deletion_orphan_upgrade(self):
         self.list_manager.createList(name="Root Parent", listId="L1")
         self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Cereal")
         self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
-        
+
         self.list_manager.deleteList("L1")
-        
-        child_list = db.lists.get("L2")
+
+        child_list = self.db.lists.get("L2")
         child_view = self.list_manager.readListDisplayItems("L2")
-        
+
         self.assertIsNone(child_list.parentId)
         self.assertEqual(len(child_view), 1)
         self.assertEqual(child_view[0]["name"], "Cereal")
-        self.assertFalse(child_view[0]["isInherited"])  
+        self.assertFalse(child_view[0]["isInherited"])
 
     def test_user_profile_list_binding(self):
         """Verifies the User domain properties and cross-entity relational ownership."""
-        # 1. Initialize user with a string-based zip code profile matching requirements
         mock_user = User(
-            username="ethan99", 
-            password="securePassword123", 
-            firstName="Ethan", 
-            lastName="Project", 
+            username="ethan99",
+            password="securePassword123",
+            firstName="Ethan",
+            lastName="Project",
             zipCode="02108"  # String type preserves critical leading zeros
         )
-        
-        # Assert user initialization variables mapped properly
+
         self.assertEqual(mock_user.username, "ethan99")
         self.assertEqual(mock_user.zipCode, "02108")
-        
-        # 2. Create a list explicitly associated with this authenticated user
+
         user_list = self.list_manager.createList(
-            name="My Private List", 
-            listId="UL_99", 
-            optionalParentId=None, 
+            name="My Private List",
+            listId="UL_99",
+            optionalParentId=None,
             userId=mock_user.username
         )
-        
-        # Verify the list data entity successfully maps back to our User owner
+
         self.assertEqual(user_list.userId, "ethan99")
         self.assertIsNone(user_list.parentId)
+
+    # ------------------------------------------
+    # Regression tests for fixed bugs
+    # ------------------------------------------
+
+    def test_reediting_fork_does_not_corrupt_parent(self):
+        """Editing a forked item twice must not overwrite the master item name."""
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Apples")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+
+        self.item_manager.editItemInList("L2", "I1", "Green Apples")
+        self.item_manager.editItemInList("L2", "I1", "Organic Green Apples")  # second edit
+
+        self.assertEqual(self.list_manager.readListDisplayItems("L1")[0]["name"], "Apples")
+        self.assertEqual(self.list_manager.readListDisplayItems("L2")[0]["name"], "Organic Green Apples")
+
+    def test_custom_name_survives_parent_deletion(self):
+        """Hard-copy snapshots must preserve customNameOverride."""
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Apples")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+        self.item_manager.editItemInList("L2", "I1", "Organic Apples")
+
+        self.list_manager.deleteList("L1")
+
+        child_view = self.list_manager.readListDisplayItems("L2")
+        self.assertEqual(len(child_view), 1)
+        self.assertEqual(child_view[0]["name"], "Organic Apples")
+
+    def test_removing_fork_does_not_resurrect_parent_item(self):
+        """Deleting a forked item in a child must not make the parent version reappear."""
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Apples")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+        self.item_manager.editItemInList("L2", "I1", "Organic Apples")  # fork
+
+        self.item_manager.removeItemFromList("L2", "I1")
+
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L2")), 0)
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L1")), 1)
+
+    def test_repeated_removal_does_not_stack_masks(self):
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Apples")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+
+        self.item_manager.removeItemFromList("L2", "I1")
+        self.item_manager.removeItemFromList("L2", "I1")
+        self.item_manager.removeItemFromList("L2", "I1")
+
+        masks = [e for e in self.db.entries if e.listId == "L2" and e.isMaskedHidden]
+        self.assertEqual(len(masks), 1)
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L2")), 0)
+
+    def test_masked_item_stays_hidden_after_middle_list_deleted(self):
+        """A child's mask of a grandparent item must survive deleting the middle list."""
+        self.list_manager.createList(name="Grandparent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Parent", listId="L2", optionalParentId="L1")
+        self.list_manager.createList(name="Child", listId="L3", optionalParentId="L2")
+        self.item_manager.removeItemFromList("L3", "I1")  # mask the inherited grandparent item
+
+        self.list_manager.deleteList("L2")
+
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L3")), 0)
+
+    def test_child_view_unchanged_after_middle_list_deleted(self):
+        """Items contributed by a deleted middle list are hard-copied into children."""
+        self.list_manager.createList(name="Grandparent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Parent", listId="L2", optionalParentId="L1")
+        self.item_manager.addItemToList(listId="L2", itemId="I2", itemName="Eggs")
+        self.list_manager.createList(name="Child", listId="L3", optionalParentId="L2")
+
+        self.list_manager.deleteList("L2")
+
+        names = sorted(i["name"] for i in self.list_manager.readListDisplayItems("L3"))
+        self.assertEqual(names, ["Eggs", "Milk"])
+        self.assertEqual(self.db.lists["L3"].parentId, "L1")
+
+    # ------------------------------------------
+    # Newly implemented functionality
+    # ------------------------------------------
+
+    def test_rename_list(self):
+        self.list_manager.createList(name="Old Name", listId="L1")
+        self.list_manager.renameList("L1", "New Name")
+        self.assertEqual(self.db.lists["L1"].listName, "New Name")
+
+        with self.assertRaises(ValueError):
+            self.list_manager.renameList("L1", "")
+        with self.assertRaises(ValueError):
+            self.list_manager.renameList("NOPE", "Anything")
+
+    def test_duplicate_as_decoupled_copy(self):
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Apples")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+        self.item_manager.editItemInList("L2", "I1", "Organic Apples")
+        self.item_manager.addItemToList(listId="L2", itemId="I2", itemName="Bread")
+
+        copy = self.list_manager.duplicateAsDecoupledCopy("L2", newListId="L3")
+
+        self.assertEqual(copy.listName, "Copy of Child")
+        self.assertIsNone(copy.parentId)  # decoupled: no inheritance link
+
+        copy_names = sorted(i["name"] for i in self.list_manager.readListDisplayItems("L3"))
+        self.assertEqual(copy_names, ["Bread", "Organic Apples"])
+
+        # Mutating the copy must not affect the original
+        self.item_manager.removeItemFromList("L3", "I2")
+        original_names = sorted(i["name"] for i in self.list_manager.readListDisplayItems("L2"))
+        self.assertEqual(original_names, ["Bread", "Organic Apples"])
+
+    def test_toggle_item_checked(self):
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+
+        self.assertTrue(self.item_manager.toggleItemChecked("L1", "I1"))
+        self.assertFalse(self.item_manager.toggleItemChecked("L1", "I1"))
+
+        # Checking an inherited item forks locally instead of mutating the parent
+        self.assertTrue(self.item_manager.toggleItemChecked("L2", "I1"))
+        self.assertFalse(self.list_manager.readListDisplayItems("L1")[0]["isChecked"])
+        self.assertTrue(self.list_manager.readListDisplayItems("L2")[0]["isChecked"])
+
+    def test_readding_masked_item_unhides_it(self):
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+
+        self.item_manager.removeItemFromList("L2", "I1")
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L2")), 0)
+
+        self.item_manager.addItemToList(listId="L2", itemId="I1", itemName="Milk")
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L2")), 1)
+
+    # ------------------------------------------
+    # Validation / error handling
+    # ------------------------------------------
+
+    def test_input_validation(self):
+        with self.assertRaises(ValueError):
+            self.list_manager.createList(name="X", listId="L1", optionalParentId="MISSING")
+
+        self.list_manager.createList(name="X", listId="L1")
+        with self.assertRaises(ValueError):
+            self.list_manager.createList(name="Dup", listId="L1")  # duplicate id
+
+        with self.assertRaises(ValueError):
+            self.item_manager.addItemToList(listId="MISSING", itemId="I1", itemName="Milk")
+
+        with self.assertRaises(ValueError):
+            self.item_manager.addItemToList(listId="L1", itemName="")  # empty new item name
+
+        with self.assertRaises(ValueError):
+            self.list_manager.readListDisplayItems("MISSING")
+
+        with self.assertRaises(ValueError):
+            self.item_manager.editItemInList("L1", "GHOST", "Name")  # item not in list
+
+    def test_auto_generated_ids(self):
+        g_list = self.list_manager.createList(name="Auto")
+        self.assertIn(g_list.listId, self.db.lists)
+
+        entry = self.item_manager.addItemToList(listId=g_list.listId, itemName="Milk")
+        self.assertIn(entry.itemId, self.db.items)
+        self.assertEqual(self.db.items[entry.itemId].itemName, "Milk")
 
 
 if __name__ == "__main__":
