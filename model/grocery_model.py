@@ -81,11 +81,11 @@ class ListManager:
             raise ValueError(f"List id '{listId}' already exists")
 
         if name == "":
-            if optionalParentId:
-                parent = self.db.lists.get(optionalParentId)
-                name = f"Copy of {parent.listName}" if parent else "Copy of List"
-            else:
-                name = f"List{len(self.db.lists) + 1}"
+            existing_names = {l.listName for l in self.db.lists.values()}
+            n = 1
+            while f"List{n}" in existing_names:
+                n += 1
+            name = f"List{n}"
 
         g_list = GroceryList(name, listId, optionalParentId, userId)
         self.db.lists[listId] = g_list
@@ -135,6 +135,22 @@ class ListManager:
             raise ValueError(f"List '{listId}' does not exist")
         display_map = self._compileDisplayMap(listId)
         return [v for v in display_map.values() if not v.get("hidden", False)]
+
+    def readAllLists(self) -> TypeList[GroceryList]:
+        """Returns all lists currently in the database."""
+        return list(self.db.lists.values())
+
+    def readDirectItems(self, listId: str) -> TypeList[dict]:
+        """Returns only items with a direct entry in this list (not inherited from ancestors)."""
+        if listId not in self.db.lists:
+            raise ValueError(f"List '{listId}' does not exist")
+        return [item for item in self.readListDisplayItems(listId) if not item.get("isInherited")]
+
+    def readAllItems(self, listId: str) -> TypeList[dict]:
+        """Returns all visible items for a list (inherited + direct), excluding masked entries."""
+        if listId not in self.db.lists:
+            raise ValueError(f"List '{listId}' does not exist")
+        return self.readListDisplayItems(listId)
 
     def renameList(self, listId: str, newName: str) -> None:
         """Alters a list's display name."""
