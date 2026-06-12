@@ -98,14 +98,18 @@ class ListManager:
         Returns the full map including hidden/masked items.
         """
         display_map: Dict[str, dict] = {}
+        ancestor_item_ids: set = set()  # itemIds present in any ancestor list
         current_pointer: Optional[str] = listId
         visited = set()  # guards against accidental parent-pointer cycles
 
         while current_pointer is not None and current_pointer not in visited:
             visited.add(current_pointer)
+            is_ancestor = current_pointer != listId
             current_entries = [e for e in self.db.entries if e.listId == current_pointer]
 
             for entry in current_entries:
+                if is_ancestor:
+                    ancestor_item_ids.add(entry.itemId)
                 if entry.itemId in display_map:
                     continue
                 if entry.isMaskedHidden:
@@ -119,13 +123,20 @@ class ListManager:
                     "itemId": entry.itemId,
                     "name": item_name,
                     "isChecked": entry.isChecked,
-                    "isInherited": entry.listId != listId,
+                    "isInherited": is_ancestor,
                     "customNameOverride": entry.customNameOverride,
                     "hidden": False,
                 }
 
             g_list = self.db.lists.get(current_pointer)
             current_pointer = g_list.parentId if g_list else None
+
+        # A forked item (local entry overriding an ancestor's item) is still inherited.
+        # Without this pass, renaming/toggling an inherited item would silently drop its
+        # inherited status because the fork entry carries listId == listId.
+        for item_id, data in display_map.items():
+            if not data.get("hidden") and item_id in ancestor_item_ids:
+                data["isInherited"] = True
 
         return display_map
 
@@ -246,12 +257,34 @@ class ItemManager:
             pointer = ancestor.parentId if ancestor else None
         return False
 
+    def _findItemIdByName(self, listId: str, itemName: str) -> Optional[str]:
+        """
+        Looks up an existing itemId whose display name matches itemName.
+        Masked entries in this list are checked first (by override or master name)
+        so that re-adding a deleted inherited item reuses the same id and unmasks it.
+        """
+        for entry in self.db.entries:
+            if entry.listId == listId and entry.isMaskedHidden:
+                master = self.db.items.get(entry.itemId)
+                display = entry.customNameOverride or (master.itemName if master else None)
+                if display == itemName:
+                    return entry.itemId
+        for item in self.db.items.values():
+            if item.itemName == itemName:
+                return item.itemId
+        return None
+
     def addItemToList(self, listId: str, itemId: Optional[str] = None, itemName: str = "") -> ListEntry:
         """Appends a fresh line entry localized to the targeted list scope."""
         if listId not in self.db.lists:
             raise ValueError(f"List '{listId}' does not exist")
         if itemName == "" and (itemId is None or itemId not in self.db.items):
             raise ValueError("Item name cannot be empty for a new item")
+
+        # When adding by name only, reuse an existing itemId if one matches so that
+        # re-adding a masked inherited item unmasks it rather than creating a duplicate.
+        if itemId is None and itemName:
+            itemId = self._findItemIdByName(listId, itemName)
 
         if itemId is None:
             itemId = str(uuid.uuid4())
@@ -307,12 +340,23 @@ class ItemManager:
         else:
             raise ValueError(f"Item '{itemId}' is not in list '{listId}'")
 
+    def _purgeDescendantForks(self, listId: str, itemId: str) -> None:
+        """Remove orphaned local entries (forks, masks, re-adds) for itemId in all
+        descendants of listId when the item no longer has an ancestor providing it."""
+        for child in [l for l in self.db.lists.values() if l.parentId == listId]:
+            local_entry = self._entryInList(child.listId, itemId)
+            if local_entry is not None and not self._inheritedFromAncestor(child.listId, itemId):
+                self.db.entries.remove(local_entry)
+            self._purgeDescendantForks(child.listId, itemId)
+
     def removeItemFromList(self, listId: str, itemId: str) -> None:
         """
         Hard-deletes native items, or applies an exclusion mask for inherited
         ones. Removing a local fork of an inherited item also masks it so the
         ancestor's version does not resurface. Repeated removals are no-ops
         rather than stacking duplicate masks.
+        When a native item is deleted, any descendant forks/masks for the same
+        itemId are also purged since their ancestry source is gone.
         """
         entry = self._entryInList(listId, itemId)
         inherited = self._inheritedFromAncestor(listId, itemId)
@@ -327,5 +371,6 @@ class ItemManager:
                 entry.isChecked = False
             else:
                 self.db.entries.remove(entry)
+                self._purgeDescendantForks(listId, itemId)
         elif inherited:
             self.db.entries.append(ListEntry(listId=listId, itemId=itemId, isMaskedHidden=True))

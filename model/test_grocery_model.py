@@ -459,6 +459,79 @@ class TestGroceryDataModel(unittest.TestCase):
         self._show(g_list.listId, "Auto")
 
 
+    def test_deleting_native_item_removes_descendant_forks(self):
+        _sep("test_deleting_native_item_removes_descendant_forks")
+
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+        self.item_manager.editItemInList("L2", "I1", "Organic Milk")
+        print("After forking 'Milk' -> 'Organic Milk' in child:")
+        self._show("L1", "parent")
+        self._show("L2", "child")
+
+        self.item_manager.removeItemFromList("L1", "I1")
+        print("\nAfter deleting 'Milk' from parent:")
+        self._show("L1", "parent")
+        self._show("L2", "child")
+        print("  (fork in child purged -- source is gone)")
+
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L1")), 0)
+        self.assertEqual(len(self.list_manager.readListDisplayItems("L2")), 0)
+
+    def test_deleting_native_item_preserves_fork_when_grandparent_provides_it(self):
+        _sep("test_deleting_native_item_preserves_fork_when_grandparent_provides_it")
+
+        self.list_manager.createList(name="Grandparent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Parent", listId="L2", optionalParentId="L1")
+        self.list_manager.createList(name="Child", listId="L3", optionalParentId="L2")
+        self.item_manager.editItemInList("L3", "I1", "Organic Milk")
+        print("After forking 'Milk' -> 'Organic Milk' in grandchild:")
+        self._show("L1", "L1")
+        self._show("L2", "L2")
+        self._show("L3", "L3")
+
+        # L2 has no native entry for I1 (it inherited it), so removing from L2 just masks it
+        self.item_manager.removeItemFromList("L2", "I1")
+        print("\nAfter masking 'Milk' in parent (grandparent still has it):")
+        self._show("L1", "L1")
+        self._show("L2", "L2")
+        self._show("L3", "L3")
+        print("  (grandparent still provides Milk; L3 fork still valid via grandparent)")
+
+        # Grandparent still has I1, so L3's fork must survive
+        items_l3 = self.list_manager.readListDisplayItems("L3")
+        self.assertEqual(len(items_l3), 1)
+        self.assertEqual(items_l3[0]["name"], "Organic Milk")
+        self.assertTrue(items_l3[0]["isInherited"])
+
+    def test_readding_masked_inherited_item_by_name(self):
+        _sep("test_readding_masked_inherited_item_by_name")
+
+        self.list_manager.createList(name="Parent", listId="L1")
+        self.item_manager.addItemToList(listId="L1", itemId="I1", itemName="Milk")
+        self.list_manager.createList(name="Child", listId="L2", optionalParentId="L1")
+        print("Initial state:")
+        self._show("L1", "parent")
+        self._show("L2", "child")
+
+        self.item_manager.removeItemFromList("L2", "I1")
+        print("\nAfter removing 'Milk' from child (masked):")
+        self._show("L2", "child")
+
+        # Add back by name only -- simulates the app calling addItemToList(itemName="Milk")
+        self.item_manager.addItemToList(listId="L2", itemName="Milk")
+        print("\nAfter re-adding 'Milk' by name only:")
+        self._show("L2", "child")
+        print("  (mask lifted; inheritance preserved; same itemId reused)")
+
+        items = self.list_manager.readListDisplayItems("L2")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["name"], "Milk")
+        self.assertEqual(items[0]["itemId"], "I1")
+        self.assertTrue(items[0]["isInherited"])
+
     def test_read_all_lists(self):
         _sep("test_read_all_lists")
 
