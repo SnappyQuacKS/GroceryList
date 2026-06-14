@@ -1,3 +1,6 @@
+import hashlib
+import json
+import os
 import uuid
 from typing import Dict, Optional, List as TypeList
 
@@ -51,14 +54,86 @@ class GroceryList:  # Named 'GroceryList' to avoid keyword conflicts with Python
 class Database:
     """Simple in-memory store. Swap this out for a real persistence layer later."""
     def __init__(self):
+        self.users: Dict[str, User] = {}
         self.lists: Dict[str, GroceryList] = {}
         self.items: Dict[str, Item] = {}
         self.entries: TypeList[ListEntry] = []
 
     def clear(self) -> None:
+        self.users.clear()
         self.lists.clear()
         self.items.clear()
         self.entries.clear()
+
+    def to_dict(self) -> dict:
+        return {
+            "users": [
+                {
+                    "username": u.username,
+                    "password": u.password,
+                    "firstName": u.firstName,
+                    "lastName": u.lastName,
+                    "zipCode": u.zipCode,
+                }
+                for u in self.users.values()
+            ],
+            "lists": [
+                {"listId": l.listId, "listName": l.listName, "parentId": l.parentId, "userId": l.userId}
+                for l in self.lists.values()
+            ],
+            "items": [
+                {"itemId": i.itemId, "itemName": i.itemName}
+                for i in self.items.values()
+            ],
+            "entries": [
+                {
+                    "listId": e.listId,
+                    "itemId": e.itemId,
+                    "isChecked": e.isChecked,
+                    "isMaskedHidden": e.isMaskedHidden,
+                    "customNameOverride": e.customNameOverride,
+                }
+                for e in self.entries
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Database":
+        db = cls()
+        for u in data.get("users", []):
+            db.users[u["username"]] = User(
+                username=u["username"],
+                password=u["password"],
+                firstName=u.get("firstName", ""),
+                lastName=u.get("lastName", ""),
+                zipCode=u.get("zipCode", ""),
+            )
+        for l in data.get("lists", []):
+            db.lists[l["listId"]] = GroceryList(
+                listName=l["listName"], listId=l["listId"],
+                parentId=l.get("parentId"), userId=l.get("userId"),
+            )
+        for i in data.get("items", []):
+            db.items[i["itemId"]] = Item(itemId=i["itemId"], itemName=i["itemName"])
+        for e in data.get("entries", []):
+            db.entries.append(ListEntry(
+                listId=e["listId"], itemId=e["itemId"],
+                isChecked=e.get("isChecked", False),
+                isMaskedHidden=e.get("isMaskedHidden", False),
+                customNameOverride=e.get("customNameOverride"),
+            ))
+        return db
+
+    def save(self, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "Database":
+        if not os.path.exists(path):
+            return cls()
+        with open(path, "r", encoding="utf-8") as f:
+            return cls.from_dict(json.load(f))
 
 
 # ==========================================
@@ -374,3 +449,43 @@ class ItemManager:
                 self._purgeDescendantForks(listId, itemId)
         elif inherited:
             self.db.entries.append(ListEntry(listId=listId, itemId=itemId, isMaskedHidden=True))
+
+
+# ==========================================
+# 4. USER MANAGEMENT
+# ==========================================
+
+class UserManager:
+    """Handles account creation and authentication."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    @staticmethod
+    def _hash(password: str) -> str:
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def createUser(self, username: str, password: str,
+                   firstName: str = "", lastName: str = "", zipCode: str = "") -> User:
+        if not username.strip():
+            raise ValueError("Username cannot be empty")
+        if username in self.db.users:
+            raise ValueError(f"Username '{username}' is already taken")
+        if not password:
+            raise ValueError("Password cannot be empty")
+        user = User(
+            username=username,
+            password=self._hash(password),
+            firstName=firstName,
+            lastName=lastName,
+            zipCode=zipCode,
+        )
+        self.db.users[username] = user
+        return user
+
+    def authenticate(self, username: str, password: str) -> Optional[User]:
+        """Returns the User on success, None on bad credentials."""
+        user = self.db.users.get(username)
+        if user and user.password == self._hash(password):
+            return user
+        return None
