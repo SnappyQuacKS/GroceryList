@@ -1,8 +1,27 @@
 import hashlib
-import json
-import os
 import uuid
 from typing import Dict, Optional, List as TypeList
+
+try:
+    import psycopg2
+except ImportError:
+    raise ImportError("psycopg2 is required: pip install psycopg2-binary")
+
+# ==========================================
+# DATABASE CONNECTION CONFIG
+# ==========================================
+
+DB_CONFIG = {
+    "host":     "localhost",
+    "port":     5432,
+    "dbname":   "grocerylist",
+    "user":     "postgres",
+    "password": "user123",
+}
+
+def _connect():
+    return psycopg2.connect(**DB_CONFIG)
+
 
 # ==========================================
 # 1. CORE ENTITIES (DATA OBJECTS)
@@ -12,10 +31,10 @@ class User:
     """Represents an application user profile."""
     def __init__(self, username: str, password: str, firstName: str, lastName: str, zipCode: str):
         self.username: str = username
-        self.password: str = password  # NOTE: hash this before persisting in a real backend
+        self.password: str = password
         self.firstName: str = firstName
         self.lastName: str = lastName
-        self.zipCode: str = zipCode  # Kept as String to avoid dropping leading zeros
+        self.zipCode: str = zipCode  # Kept as str to avoid dropping leading zeros
 
 
 class Item:
@@ -30,34 +49,54 @@ class ListEntry:
     Acts as the Junction Class mapping a single Item to a specific List container.
     Tracks state modifications unique to this specific list context.
     """
-    def __init__(self, listId: str, itemId: str, isChecked: bool = False, isMaskedHidden: bool = False, customNameOverride: Optional[str] = None):
+    def __init__(self, listId: str, itemId: str, isChecked: bool = False,
+                 isMaskedHidden: bool = False, customNameOverride: Optional[str] = None):
         self.listId: str = listId
         self.itemId: str = itemId
         self.isChecked: bool = isChecked
         self.isMaskedHidden: bool = isMaskedHidden
-        self.customNameOverride: Optional[str] = customNameOverride  # Set when child customizes an inherited item name
+        self.customNameOverride: Optional[str] = customNameOverride
 
 
-class GroceryList:  # Named 'GroceryList' to avoid keyword conflicts with Python's native list type
+class GroceryList:
     """Represents an individual grocery list node within the hierarchical tree structure."""
-    def __init__(self, listName: str, listId: str, parentId: Optional[str] = None, userId: Optional[str] = None):
+    def __init__(self, listName: str, listId: str,
+                 parentId: Optional[str] = None, userId: Optional[str] = None):
         self.listName: str = listName
         self.listId: str = listId
-        self.parentId: Optional[str] = parentId  # None indicates a standalone root parent list
-        self.userId: Optional[str] = userId      # None indicates a local device guest cache state
+        self.parentId: Optional[str] = parentId
+        self.userId: Optional[str] = userId
 
 
 # ==========================================
-# 2. STORAGE LAYER (IN-MEMORY DATABASE)
+# 2. STORAGE LAYER
 # ==========================================
+
+def _topo_sort_lists(lists_dict: Dict[str, "GroceryList"]) -> TypeList["GroceryList"]:
+    """Return lists sorted so every parent appears before its children."""
+    sorted_out: TypeList[GroceryList] = []
+    remaining = dict(lists_dict)
+    while remaining:
+        done_ids = {l.listId for l in sorted_out}
+        ready = [l for l in remaining.values() if l.parentId is None or l.parentId in done_ids]
+        if not ready:
+            # Circular or orphaned refs — append remainder as-is
+            sorted_out.extend(remaining.values())
+            break
+        for lst in ready:
+            sorted_out.append(lst)
+            del remaining[lst.listId]
+    return sorted_out
+
 
 class Database:
-    """Simple in-memory store. Swap this out for a real persistence layer later."""
+    """In-memory store that syncs to PostgreSQL on save/load."""
+
     def __init__(self):
-        self.users: Dict[str, User] = {}
-        self.lists: Dict[str, GroceryList] = {}
-        self.items: Dict[str, Item] = {}
-        self.entries: TypeList[ListEntry] = []
+        self.users:   Dict[str, User]        = {}
+        self.lists:   Dict[str, GroceryList] = {}
+        self.items:   Dict[str, Item]        = {}
+        self.entries: TypeList[ListEntry]    = []
 
     def clear(self) -> None:
         self.users.clear()
@@ -65,75 +104,94 @@ class Database:
         self.items.clear()
         self.entries.clear()
 
-    def to_dict(self) -> dict:
-        return {
-            "users": [
-                {
-                    "username": u.username,
-                    "password": u.password,
-                    "firstName": u.firstName,
-                    "lastName": u.lastName,
-                    "zipCode": u.zipCode,
-                }
-                for u in self.users.values()
-            ],
-            "lists": [
-                {"listId": l.listId, "listName": l.listName, "parentId": l.parentId, "userId": l.userId}
-                for l in self.lists.values()
-            ],
-            "items": [
-                {"itemId": i.itemId, "itemName": i.itemName}
-                for i in self.items.values()
-            ],
-            "entries": [
-                {
-                    "listId": e.listId,
-                    "itemId": e.itemId,
-                    "isChecked": e.isChecked,
-                    "isMaskedHidden": e.isMaskedHidden,
-                    "customNameOverride": e.customNameOverride,
-                }
-                for e in self.entries
-            ],
-        }
+    # ── Persistence ────────────────────────────────────────────────────────────
+
+    def save(self) -> None:
+        """Persist the full in-memory state to PostgreSQL (replace-all strategy)."""
+        conn = _connect()
+        cur = conn.cursor()
+        try:
+            # Defer FK checks so we can delete/insert in any order
+            cur.execute("SET CONSTRAINTS ALL DEFERRED")
+
+            cur.execute("DELETE FROM list_entries")
+            cur.execute("DELETE FROM grocery_lists")
+            cur.execute("DELETE FROM items")
+            cur.execute("DELETE FROM users")
+
+            for u in self.users.values():
+                cur.execute(
+                    "INSERT INTO users (username, password_hash, first_name, last_name, zip_code) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (u.username, u.password, u.firstName, u.lastName, u.zipCode),
+                )
+
+            for i in self.items.values():
+                cur.execute(
+                    "INSERT INTO items (item_id, item_name) VALUES (%s, %s)",
+                    (i.itemId, i.itemName),
+                )
+
+            for lst in _topo_sort_lists(self.lists):
+                cur.execute(
+                    "INSERT INTO grocery_lists (list_id, list_name, parent_id, user_id) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (lst.listId, lst.listName, lst.parentId, lst.userId),
+                )
+
+            for e in self.entries:
+                cur.execute(
+                    "INSERT INTO list_entries "
+                    "(list_id, item_id, is_checked, is_masked_hidden, custom_name_override) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (e.listId, e.itemId, e.isChecked, e.isMaskedHidden, e.customNameOverride),
+                )
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
 
     @classmethod
-    def from_dict(cls, data: dict) -> "Database":
+    def load(cls) -> "Database":
+        """Load the full state from PostgreSQL into memory."""
         db = cls()
-        for u in data.get("users", []):
-            db.users[u["username"]] = User(
-                username=u["username"],
-                password=u["password"],
-                firstName=u.get("firstName", ""),
-                lastName=u.get("lastName", ""),
-                zipCode=u.get("zipCode", ""),
-            )
-        for l in data.get("lists", []):
-            db.lists[l["listId"]] = GroceryList(
-                listName=l["listName"], listId=l["listId"],
-                parentId=l.get("parentId"), userId=l.get("userId"),
-            )
-        for i in data.get("items", []):
-            db.items[i["itemId"]] = Item(itemId=i["itemId"], itemName=i["itemName"])
-        for e in data.get("entries", []):
-            db.entries.append(ListEntry(
-                listId=e["listId"], itemId=e["itemId"],
-                isChecked=e.get("isChecked", False),
-                isMaskedHidden=e.get("isMaskedHidden", False),
-                customNameOverride=e.get("customNameOverride"),
-            ))
-        return db
+        conn = _connect()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT username, password_hash, first_name, last_name, zip_code FROM users")
+            for username, password_hash, first_name, last_name, zip_code in cur.fetchall():
+                u = User(username=username, password=password_hash,
+                         firstName=first_name, lastName=last_name, zipCode=zip_code)
+                db.users[u.username] = u
 
-    def save(self, path: str) -> None:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2)
+            cur.execute("SELECT item_id, item_name FROM items")
+            for item_id, item_name in cur.fetchall():
+                i = Item(itemId=item_id, itemName=item_name)
+                db.items[i.itemId] = i
 
-    @classmethod
-    def load(cls, path: str) -> "Database":
-        if not os.path.exists(path):
-            return cls()
-        with open(path, "r", encoding="utf-8") as f:
-            return cls.from_dict(json.load(f))
+            cur.execute("SELECT list_id, list_name, parent_id, user_id FROM grocery_lists")
+            for list_id, list_name, parent_id, user_id in cur.fetchall():
+                lst = GroceryList(listName=list_name, listId=list_id,
+                                  parentId=parent_id, userId=user_id)
+                db.lists[lst.listId] = lst
+
+            cur.execute(
+                "SELECT list_id, item_id, is_checked, is_masked_hidden, custom_name_override "
+                "FROM list_entries"
+            )
+            for list_id, item_id, is_checked, is_masked_hidden, custom_name_override in cur.fetchall():
+                e = ListEntry(listId=list_id, itemId=item_id, isChecked=is_checked,
+                              isMaskedHidden=is_masked_hidden, customNameOverride=custom_name_override)
+                db.entries.append(e)
+
+            return db
+        finally:
+            cur.close()
+            conn.close()
 
 
 # ==========================================
@@ -146,7 +204,8 @@ class ListManager:
     def __init__(self, db: Database):
         self.db = db
 
-    def createList(self, name: str, listId: Optional[str] = None, optionalParentId: Optional[str] = None, userId: Optional[str] = None) -> GroceryList:
+    def createList(self, name: str, listId: Optional[str] = None,
+                   optionalParentId: Optional[str] = None, userId: Optional[str] = None) -> GroceryList:
         """Instantiates a standard root list or an extended child branch."""
         if optionalParentId is not None and optionalParentId not in self.db.lists:
             raise ValueError(f"Parent list '{optionalParentId}' does not exist")
@@ -170,12 +229,11 @@ class ListManager:
         """
         Bottom-Up Compilation Loop. Walks from the target list up through its
         ancestors; the first (deepest) entry seen for each itemId wins.
-        Returns the full map including hidden/masked items.
         """
         display_map: Dict[str, dict] = {}
-        ancestor_item_ids: set = set()  # itemIds present in any ancestor list
+        ancestor_item_ids: set = set()
         current_pointer: Optional[str] = listId
-        visited = set()  # guards against accidental parent-pointer cycles
+        visited = set()
 
         while current_pointer is not None and current_pointer not in visited:
             visited.add(current_pointer)
@@ -192,7 +250,9 @@ class ListManager:
                     continue
 
                 master_item = self.db.items.get(entry.itemId)
-                item_name = entry.customNameOverride if entry.customNameOverride else (master_item.itemName if master_item else "Unknown")
+                item_name = entry.customNameOverride if entry.customNameOverride else (
+                    master_item.itemName if master_item else "Unknown"
+                )
 
                 display_map[entry.itemId] = {
                     "itemId": entry.itemId,
@@ -207,8 +267,6 @@ class ListManager:
             current_pointer = g_list.parentId if g_list else None
 
         # A forked item (local entry overriding an ancestor's item) is still inherited.
-        # Without this pass, renaming/toggling an inherited item would silently drop its
-        # inherited status because the fork entry carries listId == listId.
         for item_id, data in display_map.items():
             if not data.get("hidden") and item_id in ancestor_item_ids:
                 data["isInherited"] = True
@@ -227,7 +285,7 @@ class ListManager:
         return list(self.db.lists.values())
 
     def readDirectItems(self, listId: str) -> TypeList[dict]:
-        """Returns only items with a direct entry in this list (not inherited from ancestors)."""
+        """Returns only items with a direct entry in this list (not inherited)."""
         if listId not in self.db.lists:
             raise ValueError(f"List '{listId}' does not exist")
         return [item for item in self.readListDisplayItems(listId) if not item.get("isInherited")]
@@ -239,7 +297,6 @@ class ListManager:
         return self.readListDisplayItems(listId)
 
     def renameList(self, listId: str, newName: str) -> None:
-        """Alters a list's display name."""
         target = self.db.lists.get(listId)
         if not target:
             raise ValueError(f"List '{listId}' does not exist")
@@ -261,18 +318,14 @@ class ListManager:
         grandparent_id = target_list.parentId
         immediate_children = [l for l in self.db.lists.values() if l.parentId == listId]
 
-        # 1. Snapshot each child's full compiled view while the parent is intact
         child_snapshots = {child.listId: self._compileDisplayMap(child.listId) for child in immediate_children}
 
-        # 2. Pointer repair: promote children to the grandparent (or root)
         for child in immediate_children:
             child.parentId = grandparent_id
 
-        # 3. Purge the deleted list's records
         self.db.entries = [e for e in self.db.entries if e.listId != listId]
         del self.db.lists[listId]
 
-        # 4. Reconcile each child against its snapshot so its view is unchanged
         for child in immediate_children:
             before = child_snapshots[child.listId]
             after = self._compileDisplayMap(child.listId)
@@ -281,14 +334,12 @@ class ListManager:
                 now = after.get(item_id)
 
                 if not snap.get("hidden", False):
-                    # Item was visible before; restore it if it vanished or changed
                     if now is None or now.get("hidden", False) or now.get("name") != snap["name"] or now.get("isChecked") != snap["isChecked"]:
                         master = self.db.items.get(item_id)
                         override = snap["name"] if (master is None or master.itemName != snap["name"]) else None
                         self.db.entries = [e for e in self.db.entries if not (e.listId == child.listId and e.itemId == item_id)]
                         self.db.entries.append(ListEntry(listId=child.listId, itemId=item_id, isChecked=snap["isChecked"], customNameOverride=override))
                 else:
-                    # Item was hidden before; re-mask it if it resurfaced via the grandparent
                     if now is not None and not now.get("hidden", False):
                         self.db.entries.append(ListEntry(listId=child.listId, itemId=item_id, isMaskedHidden=True))
 
@@ -319,7 +370,6 @@ class ItemManager:
         return next((e for e in self.db.entries if e.listId == listId and e.itemId == itemId), None)
 
     def _inheritedFromAncestor(self, listId: str, itemId: str) -> bool:
-        """True if any ancestor of listId contributes a visible entry for itemId."""
         g_list = self.db.lists.get(listId)
         pointer = g_list.parentId if g_list else None
         visited = {listId}
@@ -333,11 +383,6 @@ class ItemManager:
         return False
 
     def _findItemIdByName(self, listId: str, itemName: str) -> Optional[str]:
-        """
-        Looks up an existing itemId whose display name matches itemName.
-        Masked entries in this list are checked first (by override or master name)
-        so that re-adding a deleted inherited item reuses the same id and unmasks it.
-        """
         for entry in self.db.entries:
             if entry.listId == listId and entry.isMaskedHidden:
                 master = self.db.items.get(entry.itemId)
@@ -350,14 +395,11 @@ class ItemManager:
         return None
 
     def addItemToList(self, listId: str, itemId: Optional[str] = None, itemName: str = "") -> ListEntry:
-        """Appends a fresh line entry localized to the targeted list scope."""
         if listId not in self.db.lists:
             raise ValueError(f"List '{listId}' does not exist")
         if itemName == "" and (itemId is None or itemId not in self.db.items):
             raise ValueError("Item name cannot be empty for a new item")
 
-        # When adding by name only, reuse an existing itemId if one matches so that
-        # re-adding a masked inherited item unmasks it rather than creating a duplicate.
         if itemId is None and itemName:
             itemId = self._findItemIdByName(listId, itemName)
 
@@ -368,7 +410,7 @@ class ItemManager:
 
         existing = self._entryInList(listId, itemId)
         if existing is not None:
-            existing.isMaskedHidden = False  # re-adding un-hides a previously masked item
+            existing.isMaskedHidden = False
             return existing
 
         entry = ListEntry(listId=listId, itemId=itemId)
@@ -376,12 +418,10 @@ class ItemManager:
         return entry
 
     def toggleItemChecked(self, listId: str, itemId: str) -> bool:
-        """Flips the checked-off state of an item within this list's scope, forking if inherited."""
         entry = self._entryInList(listId, itemId)
         if entry is None:
             if not self._inheritedFromAncestor(listId, itemId):
                 raise ValueError(f"Item '{itemId}' is not in list '{listId}'")
-            # Fork so the check state is local to this list
             entry = ListEntry(listId=listId, itemId=itemId, isChecked=True)
             self.db.entries.append(entry)
             return True
@@ -389,11 +429,6 @@ class ItemManager:
         return entry.isChecked
 
     def editItemInList(self, listId: str, itemId: str, newName: str) -> None:
-        """
-        Determines whether the edit alters a native master string or forks an
-        inherited item. Re-editing an existing fork updates the fork's override
-        (it never touches the master item, fixing cross-list name corruption).
-        """
         if newName == "":
             raise ValueError("Item name cannot be empty")
 
@@ -401,23 +436,18 @@ class ItemManager:
 
         if entry is not None:
             if entry.customNameOverride is not None or self._inheritedFromAncestor(listId, itemId):
-                # This entry is a local fork of an inherited item: keep the edit local
                 entry.customNameOverride = newName
                 entry.isMaskedHidden = False
             else:
-                # Truly native to this list: edit the master definition
                 master_item = self.db.items.get(itemId)
                 if master_item:
                     master_item.itemName = newName
         elif self._inheritedFromAncestor(listId, itemId):
-            # Inherited with no local entry yet: create a fork
             self.db.entries.append(ListEntry(listId=listId, itemId=itemId, customNameOverride=newName))
         else:
             raise ValueError(f"Item '{itemId}' is not in list '{listId}'")
 
     def _purgeDescendantForks(self, listId: str, itemId: str) -> None:
-        """Remove orphaned local entries (forks, masks, re-adds) for itemId in all
-        descendants of listId when the item no longer has an ancestor providing it."""
         for child in [l for l in self.db.lists.values() if l.parentId == listId]:
             local_entry = self._entryInList(child.listId, itemId)
             if local_entry is not None and not self._inheritedFromAncestor(child.listId, itemId):
@@ -425,22 +455,13 @@ class ItemManager:
             self._purgeDescendantForks(child.listId, itemId)
 
     def removeItemFromList(self, listId: str, itemId: str) -> None:
-        """
-        Hard-deletes native items, or applies an exclusion mask for inherited
-        ones. Removing a local fork of an inherited item also masks it so the
-        ancestor's version does not resurface. Repeated removals are no-ops
-        rather than stacking duplicate masks.
-        When a native item is deleted, any descendant forks/masks for the same
-        itemId are also purged since their ancestry source is gone.
-        """
         entry = self._entryInList(listId, itemId)
         inherited = self._inheritedFromAncestor(listId, itemId)
 
         if entry is not None:
             if entry.isMaskedHidden:
-                return  # already removed/masked: no-op
+                return
             if inherited:
-                # Convert the local fork into a mask so the parent's copy stays hidden
                 entry.isMaskedHidden = True
                 entry.customNameOverride = None
                 entry.isChecked = False
@@ -484,7 +505,6 @@ class UserManager:
         return user
 
     def authenticate(self, username: str, password: str) -> Optional[User]:
-        """Returns the User on success, None on bad credentials."""
         user = self.db.users.get(username)
         if user and user.password == self._hash(password):
             return user

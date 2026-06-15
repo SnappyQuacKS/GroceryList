@@ -6,16 +6,13 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 from grocery_model import Database, ListManager, ItemManager, UserManager
 
-SAVE_PATH = os.path.join(os.path.dirname(__file__), "grocerylist_data.json")
-
-
 class GroceryApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Grocery List Manager")
         self.root.resizable(True, True)
 
-        self.db = Database.load(SAVE_PATH)
+        self.db = Database.load()
         self.user_manager = UserManager(self.db)
         self.list_manager = ListManager(self.db)
         self.item_manager = ItemManager(self.db)
@@ -30,11 +27,11 @@ class GroceryApp:
     # ------------------------------------------------------------------
 
     def _on_close(self):
-        self.db.save(SAVE_PATH)
+        self.db.save()
         self.root.destroy()
 
     def _save(self):
-        self.db.save(SAVE_PATH)
+        self.db.save()
 
     # ------------------------------------------------------------------
     # Screen switching
